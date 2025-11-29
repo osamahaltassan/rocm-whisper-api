@@ -1,73 +1,163 @@
-## 🧪 How to Test
+# ROCm Whisper API
 
-The API supports two output formats: **text** (default) and **SRT** subtitles. Translation is disabled - the API only transcribes in the original language.
+OpenAI-compatible Whisper API running on AMD GPUs via ROCm.
 
-### 1. Text Output (Default)
+## Endpoints
 
-**cURL:**
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Health check |
+| `/v1/audio/transcriptions` | POST | OpenAI-compatible transcription |
+| `/v1/audio/transcriptions/srt` | POST | SRT subtitle output |
+
+## Quick Start
+
 ```bash
-curl -X POST -F "file=@test.m4a" http://localhost:8080/transcribe
+# Build
+docker build -t rocm-whisper-api:latest .
+
+# Run
+docker compose up -d
+
+# Test
+curl -X POST -F "file=@audio.mp3" http://localhost:8080/v1/audio/transcriptions
 ```
 
-**Python:**
+## API Reference
+
+### POST /v1/audio/transcriptions
+
+OpenAI-compatible endpoint. Accepts multipart form data.
+
+**Parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | file | Yes | Audio file (mp3, wav, m4a, webm, etc.) |
+| `model` | string | No | Accepted but ignored (uses `WHISPER_MODEL` env var) |
+| `language` | string | No | ISO-639-1 code (e.g., `en`, `ko`, `ja`) |
+| `prompt` | string | No | Text to guide transcription style |
+| `response_format` | string | No | `json` (default), `text`, `verbose_json`, `vtt` |
+| `temperature` | float | No | Sampling temperature (0-1) |
+
+**Response Formats:**
+
 ```bash
-python3 client_example.py test.m4a
-# or explicitly
-python3 client_example.py test.m4a --format text
+# json (default)
+curl -X POST -F "file=@audio.mp3" http://localhost:8080/v1/audio/transcriptions
+# {"text": "Transcribed text..."}
+
+# text
+curl -X POST -F "file=@audio.mp3" -F "response_format=text" http://localhost:8080/v1/audio/transcriptions
+# Transcribed text...
+
+# verbose_json
+curl -X POST -F "file=@audio.mp3" -F "response_format=verbose_json" http://localhost:8080/v1/audio/transcriptions
+# {"task": "transcribe", "language": "en", "duration": 12.5, "text": "...", "segments": [...]}
+
+# vtt
+curl -X POST -F "file=@audio.mp3" -F "response_format=vtt" http://localhost:8080/v1/audio/transcriptions
+# WEBVTT
+# 00:00:00.000 --> 00:00:03.500
+# First segment...
 ```
 
-**Response:**
-```json
-{
-  "filename": "test.m4a",
-  "duration_seconds": 12.5,
-  "language": "en",
-  "text": "This is the transcribed text..."
-}
-```
+### POST /v1/audio/transcriptions/srt
 
----
+Dedicated SRT subtitle endpoint.
 
-### 2. SRT Subtitle Output
+**Parameters:**
 
-**cURL:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `file` | file | Yes | Audio file |
+| `language` | string | No | ISO-639-1 code |
+| `prompt` | string | No | Text to guide transcription |
+| `temperature` | float | No | Sampling temperature (0-1) |
+
+**Example:**
+
 ```bash
-curl -X POST \
-  -F "file=@test.m4a" \
-  -F "response_format=srt" \
-  http://localhost:8080/transcribe
+curl -X POST -F "file=@audio.mp3" http://localhost:8080/v1/audio/transcriptions/srt
+
+# Output:
+# 1
+# 00:00:00,000 --> 00:00:03,500
+# First segment...
+#
+# 2
+# 00:00:03,500 --> 00:00:07,200
+# Second segment...
 ```
 
-**Python:**
+**Save to file:**
+
 ```bash
-python3 client_example.py test.m4a --format srt
+curl -X POST -F "file=@audio.mp3" http://localhost:8080/v1/audio/transcriptions/srt -o output.srt
 ```
 
-**Response:**
-```json
-{
-  "filename": "test.m4a",
-  "duration_seconds": 12.5,
-  "language": "en",
-  "srt": "1\n00:00:00,000 --> 00:00:03,500\nThis is the first segment...\n\n2\n00:00:03,500 --> 00:00:07,200\nAnd this is the second...\n\n"
-}
-```
+## Python Client
 
-**Save SRT to file:**
 ```bash
-curl -X POST \
-  -F "file=@test.m4a" \
-  -F "response_format=srt" \
-  http://localhost:8080/transcribe | jq -r '.srt' > output.srt
+# Default JSON output
+python client_example.py audio.mp3
+
+# Plain text
+python client_example.py audio.mp3 --format text
+
+# Verbose JSON with segments
+python client_example.py audio.mp3 --format verbose_json
+
+# SRT subtitles
+python client_example.py audio.mp3 --format srt
+
+# VTT subtitles
+python client_example.py audio.mp3 --format vtt
+
+# Specify language
+python client_example.py audio.mp3 --language en
 ```
 
----
+## Configuration
 
-### 📋 Output Formats
+Environment variables in `docker-compose.yml`:
 
-| Format | Description | Use Case |
-|--------|-------------|----------|
-| `text` | Plain text transcription | General transcription, note-taking |
-| `srt` | SubRip subtitle format | Video subtitles, accessibility |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_MODEL` | `base` | Model size: `tiny`, `base`, `small`, `medium`, `large` |
+| `HSA_OVERRIDE_GFX_VERSION` | `11.0.0` | ROCm GPU override (for RDNA3) |
 
-**Note:** Translation is permanently disabled. The API only transcribes audio in its original language. To get English output from non-English audio, use a separate translation service.
+## Integration
+
+### Open WebUI
+
+Set Speech-to-Text URL to:
+```
+http://rocm-whisper-api:8080/v1/audio/transcriptions
+```
+
+### Python (requests)
+
+```python
+import requests
+
+with open("audio.mp3", "rb") as f:
+    response = requests.post(
+        "http://localhost:8080/v1/audio/transcriptions",
+        files={"file": f},
+        data={"response_format": "json"}
+    )
+print(response.json()["text"])
+```
+
+### Python (openai client)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+with open("audio.mp3", "rb") as f:
+    transcript = client.audio.transcriptions.create(model="whisper-1", file=f)
+print(transcript.text)
+```

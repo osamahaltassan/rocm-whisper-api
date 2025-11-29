@@ -5,145 +5,245 @@ import traceback
 import tempfile
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # --------------------------------------------------------------------------
-# 1. 모델 및 장치 설정
+# Configuration
 # --------------------------------------------------------------------------
 
-# ROCm 지원이 가능한지 확인하고 장치를 설정합니다.
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# 사용할 Whisper 모델을 선택합니다.
 MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 model = None
 
-def generate_srt(segments):
-    """Generate SRT subtitle format from Whisper segments."""
-    srt_output = []
-    for i, segment in enumerate(segments, start=1):
-        start_time = format_timestamp(segment["start"])
-        end_time = format_timestamp(segment["end"])
-        text = segment["text"].strip()
-        
-        srt_output.append(f"{i}")
-        srt_output.append(f"{start_time} --> {end_time}")
-        srt_output.append(text)
-        srt_output.append("")  # Blank line between entries
-    
-    return "\n".join(srt_output)
+# --------------------------------------------------------------------------
+# Helper Functions
+# --------------------------------------------------------------------------
 
-def format_timestamp(seconds):
-    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)."""
+def format_timestamp_srt(seconds: float) -> str:
+    """Convert seconds to SRT format (HH:MM:SS,mmm)."""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     millis = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
+
+def format_timestamp_vtt(seconds: float) -> str:
+    """Convert seconds to VTT format (HH:MM:SS.mmm)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def generate_srt(segments: list) -> str:
+    """Generate SRT subtitle format from Whisper segments."""
+    srt_lines = []
+    for i, segment in enumerate(segments, start=1):
+        start = format_timestamp_srt(segment["start"])
+        end = format_timestamp_srt(segment["end"])
+        text = segment["text"].strip()
+        srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(srt_lines)
+
+
+def generate_vtt(segments: list) -> str:
+    """Generate WebVTT subtitle format from Whisper segments."""
+    vtt_lines = ["WEBVTT\n"]
+    for segment in segments:
+        start = format_timestamp_vtt(segment["start"])
+        end = format_timestamp_vtt(segment["end"])
+        text = segment["text"].strip()
+        vtt_lines.append(f"{start} --> {end}\n{text}\n")
+    return "\n".join(vtt_lines)
+
+
+def build_verbose_response(result: dict, duration: float) -> dict:
+    """Build OpenAI verbose_json response format."""
+    segments = []
+    for seg in result.get("segments", []):
+        segments.append({
+            "id": seg.get("id", 0),
+            "seek": seg.get("seek", 0),
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"].strip(),
+            "tokens": seg.get("tokens", []),
+            "temperature": seg.get("temperature", 0.0),
+            "avg_logprob": seg.get("avg_logprob", 0.0),
+            "compression_ratio": seg.get("compression_ratio", 0.0),
+            "no_speech_prob": seg.get("no_speech_prob", 0.0),
+        })
+    
+    return {
+        "task": "transcribe",
+        "language": result.get("language", ""),
+        "duration": round(duration, 2),
+        "text": result.get("text", "").strip(),
+        "segments": segments,
+    }
+
+
+async def process_audio(
+    file: UploadFile,
+    language: Optional[str] = None,
+    prompt: Optional[str] = None,
+    temperature: float = 0.0,
+) -> dict:
+    """Process audio file and return Whisper result."""
+    if not model:
+        raise HTTPException(
+            status_code=503,
+            detail="Whisper model is not available. Check server logs."
+        )
+    
+    contents = await file.read()
+    temp_path = None
+    
+    try:
+        suffix = os.path.splitext(file.filename or ".wav")[1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(contents)
+            temp_path = tmp.name
+        
+        print(f"Transcribing: {file.filename}")
+        
+        transcribe_opts = {
+            "fp16": False,
+            "task": "transcribe",
+            "temperature": temperature,
+        }
+        if language:
+            transcribe_opts["language"] = language
+        if prompt:
+            transcribe_opts["initial_prompt"] = prompt
+        
+        result = model.transcribe(temp_path, **transcribe_opts)
+        
+        # Calculate duration from segments
+        duration = 0.0
+        if result.get("segments"):
+            duration = result["segments"][-1]["end"]
+        
+        print("Transcription successful.")
+        return {"result": result, "duration": duration}
+    
+    except Exception as e:
+        print(f"Transcription error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 # --------------------------------------------------------------------------
-# 2. FastAPI 애플리케이션 초기화 및 모델 로드
+# FastAPI Application
 # --------------------------------------------------------------------------
+
 app = FastAPI(
-    title="ROCm Whisper API",
-    description="An API to transcribe audio files using OpenAI's Whisper on ROCm.",
-    version="1.1.0" # 기능 추가로 버전 업데이트
+    title="Whisper API",
+    description="OpenAI-compatible Whisper API running on ROCm",
+    version="2.0.0",
 )
+
 
 @app.on_event("startup")
 def load_whisper_model():
-    """
-    FastAPI 앱이 시작될 때 Whisper 모델을 로드합니다.
-    """
+    """Load Whisper model on startup."""
     global model
     try:
-        print("="*50)
+        print("=" * 50)
         print(f"PyTorch version: {torch.__version__}")
         if hasattr(torch.version, 'hip'):
-            print(f"Torch is built with ROCm: {torch.version.hip}")
-        print(f"Is ROCm (GPU) available? -> {torch.cuda.is_available()}")
+            print(f"ROCm version: {torch.version.hip}")
+        print(f"GPU available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
-            print(f"Current device: {torch.cuda.current_device()}")
-            print(f"Device name: {torch.cuda.get_device_name(0)}")
-        print(f"Attempting to load Whisper model: '{MODEL_NAME}'")
-        print("="*50)
+            print(f"Device: {torch.cuda.get_device_name(0)}")
+        print(f"Loading model: {MODEL_NAME}")
+        print("=" * 50)
 
-        # 1단계: 모델을 CPU에 먼저 로드합니다.
-        print(f"Step 1: Loading model '{MODEL_NAME}' onto CPU...")
+        # Load to CPU first, then move to GPU if available
+        print("Loading model to CPU...")
         cpu_model = whisper.load_model(MODEL_NAME, device="cpu")
-        print("Step 1: Model loaded on CPU successfully.")
-
-        # 2단계: GPU가 사용 가능하면 모델을 GPU로 이동시킵니다.
+        
         if DEVICE == "cuda":
-            print(f"Step 2: Moving model to GPU ({DEVICE})...")
+            print("Moving model to GPU...")
             model = cpu_model.to(DEVICE)
-            print("Step 2: Model moved to GPU successfully.")
         else:
             model = cpu_model
         
-        print(f"\n✅ Whisper model '{MODEL_NAME}' is ready on device: {DEVICE}.\n")
+        print(f"Model ready on: {DEVICE}")
 
     except Exception as e:
-        print("="*50)
-        print("❌ FAILED TO LOAD WHISPER MODEL ❌")
+        print("=" * 50)
+        print("FAILED TO LOAD MODEL")
         traceback.print_exc()
-        print("="*50)
+        print("=" * 50)
         model = None
 
 
-@app.get("/", summary="Health Check", description="API 서버의 상태를 확인합니다.")
-def read_root():
-    status = "running"
-    model_status = "loaded" if model else "failed_to_load"
-    return {"status": status, "model_status": model_status, "model_name": MODEL_NAME}
+# --------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------
 
-@app.post("/transcribe", summary="Transcribe Audio File", description="오디오 파일을 텍스트로 변환합니다.")
-async def transcribe_audio(
+@app.get("/")
+def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "running",
+        "model_loaded": model is not None,
+        "model_name": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+@app.post("/v1/audio/transcriptions")
+async def transcribe(
     file: UploadFile = File(...),
-    response_format: Optional[str] = Form("text")
+    model: Optional[str] = Form(None),  # Accepted but ignored (uses env var)
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    response_format: Optional[str] = Form("json"),
+    temperature: Optional[float] = Form(0.0),
 ):
-    if not model:
-        raise HTTPException(status_code=503, detail="Whisper model is not available. Check server logs for details.")
+    """
+    OpenAI-compatible transcription endpoint.
     
-    contents = await file.read()
+    Supported response_format: json, text, verbose_json, vtt
+    """
+    data = await process_audio(file, language, prompt, temperature or 0.0)
+    result = data["result"]
+    duration = data["duration"]
+    
+    if response_format == "text":
+        return PlainTextResponse(content=result.get("text", "").strip())
+    
+    elif response_format == "verbose_json":
+        return JSONResponse(content=build_verbose_response(result, duration))
+    
+    elif response_format == "vtt":
+        vtt_content = generate_vtt(result.get("segments", []))
+        return PlainTextResponse(content=vtt_content, media_type="text/vtt")
+    
+    else:  # json (default)
+        return JSONResponse(content={"text": result.get("text", "").strip()})
 
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_audio_file:
-            temp_audio_file.write(contents)
-            temp_path = temp_audio_file.name
-        
-        print(f"Transcribing file: {file.filename} (format: {response_format})")
-        
-        # Force task="transcribe" to disable translation
-        result = model.transcribe(temp_path, fp16=False, task="transcribe")
 
-        duration = 0
-        if result.get("segments"):
-            last_segment = result["segments"][-1]
-            duration = last_segment["end"]
-
-        print("Transcription successful.")
-
-        # Handle different response formats
-        if response_format == "srt":
-            srt_content = generate_srt(result["segments"])
-            return JSONResponse(content={
-                "filename": file.filename,
-                "duration_seconds": round(duration, 2),
-                "language": result["language"],
-                "srt": srt_content
-            })
-        else:  # Default to text
-            return JSONResponse(content={
-                "filename": file.filename,
-                "duration_seconds": round(duration, 2),
-                "language": result["language"],
-                "text": result["text"]
-            })
-    except Exception as e:
-        print(f"❌ An error occurred during transcription: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if 'temp_path' in locals() and os.path.exists(temp_path):
-            os.remove(temp_path)
-
+@app.post("/v1/audio/transcriptions/srt")
+async def transcribe_srt(
+    file: UploadFile = File(...),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    prompt: Optional[str] = Form(None),
+    temperature: Optional[float] = Form(0.0),
+):
+    """
+    Transcription endpoint that returns SRT subtitle format.
+    """
+    data = await process_audio(file, language, prompt, temperature or 0.0)
+    result = data["result"]
+    
+    srt_content = generate_srt(result.get("segments", []))
+    return PlainTextResponse(content=srt_content, media_type="text/plain")
