@@ -3,7 +3,8 @@ import torch
 import os
 import traceback
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
 
 # --------------------------------------------------------------------------
@@ -16,6 +17,29 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # 사용할 Whisper 모델을 선택합니다.
 MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 model = None
+
+def generate_srt(segments):
+    """Generate SRT subtitle format from Whisper segments."""
+    srt_output = []
+    for i, segment in enumerate(segments, start=1):
+        start_time = format_timestamp(segment["start"])
+        end_time = format_timestamp(segment["end"])
+        text = segment["text"].strip()
+        
+        srt_output.append(f"{i}")
+        srt_output.append(f"{start_time} --> {end_time}")
+        srt_output.append(text)
+        srt_output.append("")  # Blank line between entries
+    
+    return "\n".join(srt_output)
+
+def format_timestamp(seconds):
+    """Convert seconds to SRT timestamp format (HH:MM:SS,mmm)."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 # --------------------------------------------------------------------------
 # 2. FastAPI 애플리케이션 초기화 및 모델 로드
@@ -73,9 +97,11 @@ def read_root():
     model_status = "loaded" if model else "failed_to_load"
     return {"status": status, "model_status": model_status, "model_name": MODEL_NAME}
 
-
 @app.post("/transcribe", summary="Transcribe Audio File", description="오디오 파일을 텍스트로 변환합니다.")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    response_format: Optional[str] = Form("text")
+):
     if not model:
         raise HTTPException(status_code=503, detail="Whisper model is not available. Check server logs for details.")
     
@@ -86,26 +112,34 @@ async def transcribe_audio(file: UploadFile = File(...)):
             temp_audio_file.write(contents)
             temp_path = temp_audio_file.name
         
-        print(f"Transcribing file: {file.filename}")
+        print(f"Transcribing file: {file.filename} (format: {response_format})")
         
-        result = model.transcribe(temp_path, fp16=False)
+        # Force task="transcribe" to disable translation
+        result = model.transcribe(temp_path, fp16=False, task="transcribe")
 
-        # [추가] 오디오 파일의 전체 재생 시간을 계산합니다.
         duration = 0
-        # 'segments' 정보가 있는지 확인하고, 있다면 마지막 segment의 'end' 시간을 가져옵니다.
         if result.get("segments"):
             last_segment = result["segments"][-1]
             duration = last_segment["end"]
 
         print("Transcription successful.")
 
-        # [수정] JSON 응답에 'duration_seconds' 필드를 추가합니다.
-        return JSONResponse(content={
-            "filename": file.filename,
-            "duration_seconds": round(duration, 2),
-            "language": result["language"],
-            "text": result["text"]
-        })
+        # Handle different response formats
+        if response_format == "srt":
+            srt_content = generate_srt(result["segments"])
+            return JSONResponse(content={
+                "filename": file.filename,
+                "duration_seconds": round(duration, 2),
+                "language": result["language"],
+                "srt": srt_content
+            })
+        else:  # Default to text
+            return JSONResponse(content={
+                "filename": file.filename,
+                "duration_seconds": round(duration, 2),
+                "language": result["language"],
+                "text": result["text"]
+            })
     except Exception as e:
         print(f"❌ An error occurred during transcription: {e}")
         raise HTTPException(status_code=500, detail=str(e))
