@@ -2,6 +2,10 @@
 
 OpenAI-compatible Whisper API running on AMD GPUs via ROCm.
 
+Based on:
+
+- https://github.com/jjajjara/rocm-whisper-api
+
 ## Endpoints
 
 | Endpoint | Method | Description |
